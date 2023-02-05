@@ -5,7 +5,7 @@ import tt, tt.cross
 from tqdm import tqdm
 import pickle
 import torch
-#from distributions import Funnel
+from distributions import Funnel
 
 
 #w = tt.cross.rect_cross
@@ -27,7 +27,8 @@ def make_meshgrids(dots, d, steps):
 
 def TT_cross_density(density, dots, steps, d, y=None):
     tt_grids, alpha = make_meshgrids(dots, d, steps)
-    tt_cross = tt.multifuncrs(tt_grids, density, nswp=30, do_qr=True, verb=1, )
+    print(y)
+    tt_cross = tt.multifuncrs2(tt_grids, density, eps=1e-9, nswp=30, do_qr=True, verb=1)
     return tt_cross, alpha
 
 
@@ -37,12 +38,30 @@ def linear_core_integration(alpha, block):
     return alpha * summation
 
 
-def TT_sampling(blocks, seeds, dots, steps, alphas, core_integration_method):
+def SIRT_integration(blocks, alphas):
+    # We want to have number of Choletsky decompositions.
     d = len(blocks)
     Ps = [np.array([1])] * d  # build P_k
-    for i in range(d - 1, 0, -1):
-        integrate_block = core_integration_method(alphas[i], blocks[i])
-        Ps[i - 1] = integrate_block @ Ps[i]
+    Rprev = np.array(1.).reshape((1,1))
+    Ps[-1] = Rprev
+    for i in range(d-1, 0, -1):
+        block = blocks[i].copy()
+        block = np.einsum('abi, ij -> abj', block, Rprev)
+        weight = np.ones(block.shape[1]) * alphas[i]
+        weight[0] = weight[-1] = alphas[i]/2
+        weight = np.sqrt(weight)
+        block = np.einsum('abi, b-> abi', block, weight)
+        block = block.reshape((block.shape[0], -1)).T # M = block.T block Now let's do QR
+        R = sla.qr(block, mode='economic')[1].T
+        Ps[i-1] = R
+        Rprev = R
+    return Ps
+
+
+
+def SIRT_sampling(blocks, seeds, dots, steps, alphas, core_integration_method):
+    d = len(blocks)
+    Ps = SIRT_integration(blocks, alphas)
     phis = [np.zeros(1)] * (d + 1)
     phis[0] = np.ones((seeds.shape[0], 1))
     # grid, distance = np.linspace(begin, end, k * (steps-1), retstep=True, endpoint=False)
@@ -53,32 +72,40 @@ def TT_sampling(blocks, seeds, dots, steps, alphas, core_integration_method):
         grid = np.linspace(begin, end, num=steps[i])
         block = blocks[i]
         assert np.all(~np.isnan(block))
-        psi_i = np.einsum('kij, j->ki', block, Ps[i])  # psi estimation
+        G = np.einsum('ai, ibc -> abc', phis[i], block)
         new_phi = np.empty((seeds.shape[0], block.shape[-1]))
         for l in range(seeds.shape[0]):
-            marginal_pdf = np.abs(phis[i][l, :] @ psi_i)
+            marginal_pdf = ((G[l, ...] @ Ps[i])**2).sum(axis=-1)
             sub_integral = alphas[i] * (marginal_pdf[1:] + marginal_pdf[:marginal_pdf.shape[0] - 1]) / 2
             marginal_cdf = np.cumsum(sub_integral)
             normalizing_constant = marginal_cdf[-1]
             marginal_cdf /= normalizing_constant
             marginal_pdf /= normalizing_constant
-            if i == 0 and l ==0:  # сохранение плотности для теста
+            if l == 0 and i == 0:  # сохранение плотности для теста
                 np.save(f'normal_density_{i}.npy', np.concatenate([grid.reshape((-1, 1)),
-                                                                   marginal_pdf.reshape(-1, 1) / normalizing_constant], axis=1))
-            #print(grid[
-            #          np.searchsorted(marginal_cdf, [0.1, 0.5, 0.9], side='left')
-            #      ])
-            sort_pos = np.searchsorted(marginal_cdf, seeds[l, i], side='right')
-            i1, i2 = sort_pos - 1, sort_pos
+                                                                   marginal_pdf.reshape(-1, 1)], axis=1))
+            if False:
+                print(grid[
+                      np.searchsorted(marginal_cdf, [0.1, 0.5, 0.9], side='left')
+                  ])
+            q = seeds[l, i]
+            sort_pos = np.searchsorted(marginal_cdf, q, side='right')
+            i1, i2 = sort_pos, sort_pos + 1
             pdf1, pdf2 = marginal_pdf[i1], marginal_pdf[i2]
-            cdf1 = marginal_cdf[i1]
+            cdf1, cdf2 = marginal_cdf[i1-1], marginal_cdf[i1]
             x1, x2 = grid[i1], grid[i2]
-            A = 0.5 * (pdf2 - pdf1) / (x2 - x1)
-            D = pdf1 ** 2 + 4 * A * (seeds[l, i] - cdf1)
-            if A != 0:
-                new_x = x1 + (-pdf1 + np.sqrt(np.abs(D))) / (2 * A)
+            C = (q - cdf1)
+            D = 2 * C * (pdf1 - pdf2) + pdf1**2 * (x1 - x2)
+            D *= (x1-x2)
+            h = pdf1 - pdf2
+            if np.abs(h) >= 1e-10:
+                new_x = (pdf1 * x2 - pdf2 * x1 - np.sqrt(np.abs(D)))/h
             else:
-                new_x = (seeds[l, i] - cdf1) / pdf1
+                new_x = x1 + C/pdf1
+            if new_x > x2:
+                new_x = x2
+            elif new_x < x1:
+                new_x = x1
             linear_pi = block[:, i1, :] * (x2 - new_x) / (x2 - x1) + block[:, i2, :] * (new_x - x1) / (x2 - x1)
             # new_x = grid[sort_pos]
             ans[l, i] = new_x
@@ -107,7 +134,7 @@ def normal_density_general(mu, Sigma):
         normalised_x = x - mu
         y = (normalised_x.T * sla.lu_solve(LU, normalised_x.T)).sum(axis=0)
         ans = np.exp(-y / 2) / ((2 * np.pi) ** (mu.shape[0] / 2) * np.sqrt(det))
-        return ans
+        return np.sqrt(ans)
 
     return density
 
@@ -118,8 +145,8 @@ def Funnel1(a, b):
         part1 = x[:, 0]**2/(2 * a**2)
         part2 = (x[:, 1:]**2).sum(axis=1)
         part2 *= np.exp(-2 * b * x[:, 0])/2
-        part2 += ((d-1) * b * x[:, 0])
-        ans = part1 + part2 + d/4 * np.log(2 * np.pi) + d/4 * np.log(a)
+        part2 += (d-1) * b * x[:, 0]
+        ans = part1 + part2  + d/4 * np.log(2 * np.pi) + d/4 * np.log(a)
         ans = np.exp(-ans/2)
         return ans
 
@@ -136,8 +163,8 @@ def Banana(a, b):
         ll = (
                 -0.5 * (z[..., odd] - b * z[..., even] ** 2 + (a**2)*b) ** 2
                 - ((z[..., even]) ** 2) / (2 * a**2)
-        )
-        return np.sqrt(np.exp(ll.sum(-1)))
+        ) - d/5
+        return np.exp(ll.sum(-1)/2)
 
     return density
 
@@ -168,13 +195,12 @@ class tensor:
 
 n_steps = 1
 dist = "Funnel"
-d = 20
-scale_proposal = 4.
-scale_isir = 3.
-dist_class = "Funnel"
+d = 4
 a = 2.0
 b = 0.5
-target = Funnel1(a=a, b=b)
+target = Funnel1(a=a, b=b) #normal_density_general(np.zeros(d), np.eye(d))
+#target1 = Funnel(a=a, b=b, dim=d)
+
 
 def dens_f(target, x):
     prob = target.prob(torch.Tensor(x))
@@ -183,31 +209,55 @@ def dens_f(target, x):
 
 
 dots = [(-20., 20.)] * d
-dots[0] = (-6., 6.)
-steps = [30] * d
+dots[0] = (-6, 6)
+steps = [50] * d
 lambdas = np.arange(1, d + 1)
 
-one = tt.vector.from_list([np.zeros(1000).reshape((1, 1000, 1))])
-y = one
-for _ in range(d - 1):
-    y = tt.kron(y, one)
 
-final = y
-for _ in range(10):
-    final = final + y
-print(final.r)
-cross, alpha = TT_cross_density(target,
-                                dots, steps, d)
+#grid = np.linspace(dots[0][0], dots[0][1], steps[0])
+#dens = tt.vector.from_list([np.exp(-grid**2/(2 * a**2 * d/4)).reshape(1,-1,1)])
+#y = dens
+#for i in range(1, d):
+#    grid = np.linspace(dots[i][0], dots[i][1], steps[i])
+#    dens = tt.vector.from_list([np.exp((grid - 1) ** 2 / (2 * a ** 2 * d / 4)).reshape(1,-1,1)])
+#    y = tt.kron(y, dens)
 
-f = tensor(cross)
-with open('cross.pickle', 'wb') as file:
-    pickle.dump(f, file)
-ans, pdfs = TT_sampling(cross.to_list(cross), np.random.uniform(size=(2000, d)),
+#grid = np.zeros(steps[0], dtype=float).reshape(1,-1,1)
+#grid[:, 850,:] = 1.
+
+final = tt.rand(50, d=15, r=41)
+cross, alpha = TT_cross_density(target, dots, steps, d)
+
+def check_approx(cross, l, N):
+    ans, max_diff = 0., 0.
+    grids = [
+        np.linspace(dots[k][0], dots[k][1],
+                    num=steps[k]) for k in range(len(dots))
+    ]
+    for _ in range(l):
+        perm = np.random.choice(
+            np.arange(0, 20), d
+        )
+        perm[1:] = 24
+        lin_dots = np.zeros(d)
+        for k in range(lin_dots.shape[0]):
+            lin_dots[k] = grids[k][perm[k]]
+        target_val = target(lin_dots.reshape(1, -1))[0]
+        cross_val = cross[perm.tolist()]
+        ans += (target_val - cross_val)**2
+        max_diff = max(max_diff, np.abs((target_val - cross_val)))
+    return np.sqrt(ans / l), max_diff
+
+u, m_diff = check_approx(cross, 10000, 50)
+print(u)
+print(m_diff)
+
+#f = tensor(cross)
+#with open('cross.pickle', 'wb') as file:
+#    pickle.dump(f, file)
+ans, pdfs = SIRT_sampling(cross.to_list(cross), np.random.uniform(size=(2000, d)),
                         dots, steps, alpha, linear_core_integration)
 
 np.save(f'ans{d}.npy', ans)
 #print(ans)
-
-
-
 
