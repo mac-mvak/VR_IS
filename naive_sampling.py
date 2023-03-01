@@ -36,43 +36,11 @@ def make_meshgrids_log(dots, d, steps):
         if k == 0:
             grid = np.linspace(start, end, num=steps[k])
         else:
-            grid1 = -10.**np.arange(-3, -10, step=-1)
-            grid2 = np.linspace(dots[k][0], -1e-3, num=30, endpoint=False)
+            grid1 = -10.**np.arange(-1, -10, step=-1)
+            grid2 = np.linspace(dots[k][0], -1e-1, num=15, endpoint=False)
             grid = np.concatenate([grid2, grid1, np.flip(-grid1), np.flip(-grid2)])
         grids.append(grid)
     return grids
-
-
-
-def linear_core_integration(alpha, block):
-    summation = (block[:, 1:(block.shape[1] - 1), :].sum(axis=1) +
-                 (block[:, (0, block.shape[1] - 1), :].sum(axis=1))) / 2
-    return alpha * summation
-
-
-def SIRT_integration(blocks, grids):
-    # We want to have number of Choletsky decompositions.
-    d = len(blocks)
-    Ps = [np.array([1])] * d  # build P_k
-    Rprev = np.array(1.).reshape((1,1))
-    Ps[-1] = Rprev
-    for i in range(d-1, 0, -1):
-        block = blocks[i].copy()
-        block = np.einsum('abi, ij -> abj', block, Rprev)
-        weight = np.zeros(block.shape[1])
-        alphas = grids[i][1:] - grids[i][:-1]
-        weight[1:] += alphas
-        weight[:-1] += alphas
-        weight /= 2
-        weight = np.sqrt(weight)
-        block = np.einsum('abi, b-> abi', block, weight)
-        block = block.reshape((block.shape[0], -1)).T # M = block.T block Now let's do QR
-        R = sla.qr(block, mode='economic')[1].T
-        Ps[i-1] = R
-        Rprev = R
-    return Ps
-
-
 
 def make_dens_array(grids, density):
     d = len(grids)
@@ -89,7 +57,7 @@ def integrate_last_coord(vec, grids, k):
     sub_integral[..., 1:] += vec[...,:-1]
     sub_integral[..., 1:] += vec[..., 1:]
     sub_integral[..., 1:] = np.einsum('...i, i-> ...i', sub_integral[..., 1:], alphas)
-    integral = sub_integral.sum(-1) / 2
+    integral = sub_integral.sum(-1) /2
     return integral
 
 def prepare_vec(vec, dots):
@@ -127,7 +95,7 @@ def naive_sampling(vec, seeds, dots, grids):
             sub_integral = np.zeros(marginal_pdf.shape[0])
             sub_integral[1:] += marginal_pdf[:-1]
             sub_integral[1:] += marginal_pdf[1:]
-            sub_integral[1:] *= alphas/2
+            sub_integral[1:] *= alphas
             marginal_cdf = np.cumsum(sub_integral)
             normalizing_constant = marginal_cdf[-1]
             marginal_cdf /= normalizing_constant
@@ -222,7 +190,7 @@ def Funnel2(a, b):
         #    - np.log(self.dim)
             - (d-1) * b * z1
         )
-        return np.exp(logprob1 + logprob2 - d)
+        return np.exp(logprob1 + logprob2)
 
     return prob
 
@@ -250,15 +218,29 @@ a, b = 2.0, 0.5
 d=4
 dens = Funnel2(a, b)
 dots = [(-17., 17.)] * d
-dots[0] = (-7., 7.)
-steps = [51] *d
-grids = make_meshgrids_log(dots, d, steps)
+dots[0] = (-8., 8.)
+steps = [100] *d
+grids = make_meshgrids_lin(dots, d, steps)
 W = make_dens_array(grids, dens)
-seeds = np.random.uniform(size=(2000, d))
-ans, _ = naive_sampling(W, seeds, dots, grids)
-np.save(f'ans{d}.npy', ans)
-#true = np.load(f'true{d}.npy')
-plt.scatter(ans[:, 0], ans[:, 1], label='tt')
-#plt.scatter(true[:, 0], true[:, 1], label='true', color='orange')
-plt.legend()
+k = d-1
+while len(W.shape) != 2:
+    W = integrate_last_coord(W, grids, k)
+    k-=1
+X, Y = np.meshgrid(*(grids[:2]), indexing='ij')
+plt.pcolormesh(X, Y, W)
+plt.colorbar()
 plt.show()
+#seeds = np.random.uniform(size=(2000, d))
+#ans, _ = naive_sampling(W, seeds, dots, grids)
+#np.save(f'ans{d}.npy', ans)
+#true = np.load(f'true4.npy')
+#plt.scatter(ans[:, 0], ans[:, 1], label='tt')
+#plt.scatter(true[:, 0], true[:, 1], label='true', color='orange')
+#plt.legend()
+#plt.show()
+
+
+#grid = np.linspace(-np.pi/3, np.pi/4, num=1000)
+#f = np.tan(grid)
+#ans = integrate_last_coord(f, [grid], 0)
+#print(ans)
